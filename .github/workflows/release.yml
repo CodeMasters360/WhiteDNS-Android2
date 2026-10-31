@@ -31,14 +31,30 @@ jobs:
         with:
           fetch-depth: 0 # دریافت کل تاریخچه و تگ‌ها
 
-      - name: Force fetch and sync submodules
+      - name: Fetch and set up native DNS dependencies
         run: |
           set -euo pipefail
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
-          echo "=== Submodule Status ==="
-          git submodule status
-          ls -la third_party/
+          mkdir -p third_party
+
+          echo ">>> 1. Cloning latest CottenDns..."
+          rm -rf third_party/CottenDns third_party/CottenDNS
+          git clone https://github.com/WhiteDNS/CottenDns.git third_party/CottenDns
+          ln -s CottenDns third_party/CottenDNS
+
+          echo ">>> 2. Cloning latest StormDNS..."
+          rm -rf third_party/StormDNS third_party/StormDns
+          git clone https://github.com/iampedii/StormDNS.git third_party/StormDNS
+          ln -s StormDNS third_party/StormDns
+
+          echo ">>> 3. Syncing remaining submodules (e.g. Soar engine)..."
+          git submodule sync --recursive || true
+          git submodule update --init --recursive --force || true
+
+          echo "=== Latest Commit Hashes Used ==="
+          (cd third_party/CottenDns && echo "CottenDns at: $(git rev-parse --short HEAD)")
+          (cd third_party/StormDNS && echo "StormDNS at: $(git rev-parse --short HEAD)")
+          ls -la third_party/CottenDns/go.mod
+          ls -la third_party/StormDNS/go.mod
 
       - name: Resolve release tag
         run: |
