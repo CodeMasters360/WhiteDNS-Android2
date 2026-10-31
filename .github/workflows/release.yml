@@ -10,6 +10,7 @@ on:
   push:
     tags:
       - "*"
+  workflow_dispatch: # ایجاد دکمه دستی در گیتهاب اکشنز
 
 permissions:
   contents: write
@@ -28,7 +29,7 @@ jobs:
       - name: Checkout WhiteDNS
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # دریافت کل تاریخچه و تگ‌ها
 
       - name: Force fetch and sync submodules
         run: |
@@ -38,6 +39,24 @@ jobs:
           echo "=== Submodule Status ==="
           git submodule status
           ls -la third_party/
+
+      - name: Resolve release tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            # دریافت خودکار آخرین تگ در صورت اجرای دستی با دکمه
+            TAG=$(git describe --tags --abbrev=0 2>/dev/null || git tag --sort=-v:refname | head -n 1)
+          fi
+
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::هیچ تگی در این ریپازیتوری پیدا نشد!"
+            exit 1
+          fi
+
+          echo "Target Release Tag: ${TAG}"
+          echo "RELEASE_TAG=${TAG}" >> "$GITHUB_ENV"
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -117,7 +136,7 @@ jobs:
       - name: Build unsigned release APKs
         run: |
           set -euo pipefail
-          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_NAME="${RELEASE_TAG}"
           VERSION_NAME="${TAG_NAME#v}"
           ./gradlew :app:assembleRelease \
             -PWHITE_DNS_VERSION_NAME="${VERSION_NAME}" \
@@ -143,7 +162,7 @@ jobs:
             fi
           done
 
-          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_NAME="${RELEASE_TAG}"
           KEYSTORE_PATH="${RUNNER_TEMP}/whitedns-release.keystore"
           echo "${ANDROID_SIGNING_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
 
@@ -191,7 +210,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_NAME="${RELEASE_TAG}"
           RELEASE_TITLE="WhiteDNS ${TAG_NAME}"
           NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
 
