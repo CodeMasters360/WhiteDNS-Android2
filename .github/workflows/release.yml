@@ -1,0 +1,207 @@
+name: Official Release
+
+# Required repository secrets:
+# - ANDROID_SIGNING_KEYSTORE_BASE64
+# - ANDROID_SIGNING_STORE_PASSWORD
+# - ANDROID_SIGNING_KEY_ALIAS
+# - ANDROID_SIGNING_KEY_PASSWORD
+#
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+env:
+  ANDROID_API: "26"
+  GRADLE_ANDROID_NDK_VERSION: "26.3.11579264"
+  STORMDNS_ANDROID_NDK_VERSION: "29.0.14206865"
+
+jobs:
+  release:
+    name: Build, sign, and publish release APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout WhiteDNS
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${GRADLE_ANDROID_NDK_VERSION}" \
+            "ndk;${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Build restart-safe Android VPN bridge
+        env:
+          NDK_HOST: linux-x86_64
+        run: |
+          set -euo pipefail
+          NDK_ROOT="${ANDROID_HOME}/ndk/${STORMDNS_ANDROID_NDK_VERSION}" bash scripts/build-tun2proxy-engine.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: |
+            third_party/StormDNS/go.sum
+            third_party/CottenDns/go.sum
+            soar-engine/go.sum
+
+      - name: Build DNS native clients
+        run: |
+          set -euo pipefail
+          make stormdns cottendns soar \
+            NDK_HOST=linux-x86_64 \
+            NDK_ROOT="${ANDROID_HOME}/ndk/${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Verify native core versions
+        run: python3 scripts/verify-cottendns-apks.py --native-only
+
+      - name: Test reviewed CottenDNS core
+        working-directory: third_party/CottenDns
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 180s
+          go vet ./...
+
+      - name: Test Soar engine
+        working-directory: soar-engine
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 90s
+          go vet ./...
+
+      - name: Test patched Soar transport and wire compatibility
+        working-directory: soar-engine/third_party/soar
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 120s
+          go test -race ./... -count=1 -timeout 300s
+          go vet ./...
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Build unsigned release APKs
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION_NAME="${TAG_NAME#v}"
+          ./gradlew :app:assembleRelease \
+            -PWHITE_DNS_VERSION_NAME="${VERSION_NAME}" \
+            -PWHITE_DNS_VERSION_CODE="${GITHUB_RUN_NUMBER}"
+
+      - name: Sign release APKs
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            ANDROID_SIGNING_KEYSTORE_BASE64 \
+            ANDROID_SIGNING_STORE_PASSWORD \
+            ANDROID_SIGNING_KEY_ALIAS \
+            ANDROID_SIGNING_KEY_PASSWORD
+          do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Missing GitHub secret: ${secret_name}"
+              exit 1
+            fi
+          done
+
+          TAG_NAME="${GITHUB_REF_NAME}"
+          KEYSTORE_PATH="${RUNNER_TEMP}/whitedns-release.keystore"
+          echo "${ANDROID_SIGNING_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
+
+          BUILD_TOOLS_DIR="$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          mkdir -p dist
+
+          shopt -s nullglob
+          unsigned_apks=(app/build/outputs/apk/release/*-release-unsigned.apk)
+          if (( ${#unsigned_apks[@]} == 0 )); then
+            echo "::error::No unsigned release APKs found."
+            exit 1
+          fi
+
+          for unsigned_apk in "${unsigned_apks[@]}"; do
+            base_name="$(basename "${unsigned_apk}" -release-unsigned.apk)"
+            abi_name="${base_name#app-}"
+            aligned_apk="${RUNNER_TEMP}/${base_name}-aligned.apk"
+            signed_apk="dist/WhiteDNS-${TAG_NAME}-${abi_name}.apk"
+
+            "${BUILD_TOOLS_DIR}/zipalign" -f -p 4 "${unsigned_apk}" "${aligned_apk}"
+            "${BUILD_TOOLS_DIR}/apksigner" sign \
+              --ks "${KEYSTORE_PATH}" \
+              --ks-pass "pass:${ANDROID_SIGNING_STORE_PASSWORD}" \
+              --ks-key-alias "${ANDROID_SIGNING_KEY_ALIAS}" \
+              --key-pass "pass:${ANDROID_SIGNING_KEY_PASSWORD}" \
+              --out "${signed_apk}" \
+              "${aligned_apk}"
+            "${BUILD_TOOLS_DIR}/apksigner" verify --verbose "${signed_apk}"
+          done
+
+          cp THIRD_PARTY_NOTICES.md "dist/WhiteDNS-${TAG_NAME}-THIRD_PARTY_NOTICES.md"
+          (cd dist && shasum -a 256 * > SHA256SUMS.txt)
+
+      - name: Verify packaged Soar cores
+        run: python3 scripts/verify-soar-apks.py dist
+
+      - name: Verify packaged CottenDNS cores
+        run: python3 scripts/verify-cottendns-apks.py dist
+
+      - name: Verify packaged VPN native libraries
+        run: python3 scripts/verify-tun2proxy-native.py dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          RELEASE_TITLE="WhiteDNS ${TAG_NAME}"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+
+          if [[ -f "RELEASE-NOTES-${TAG_NAME#v}.md" ]]; then
+            cp "RELEASE-NOTES-${TAG_NAME#v}.md" "${NOTES_FILE}"
+          else
+            printf 'Official WhiteDNS release %s. See README and THIRD_PARTY_NOTICES.md.\n' "$TAG_NAME" > "$NOTES_FILE"
+          fi
+
+          release_flags=(--latest=true)
+          if [[ "${TAG_NAME}" =~ (alpha|beta|rc) ]]; then
+            release_flags=(--prerelease --latest=false)
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* \
+              --title "${RELEASE_TITLE}" \
+              --notes-file "${NOTES_FILE}" \
+              "${release_flags[@]}"
+          fi

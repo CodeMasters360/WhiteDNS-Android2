@@ -1,0 +1,141 @@
+name: Debug Build
+
+# Produces installable debug APKs for manual testing, and gives pull requests a
+# real compile — the release workflow only runs on tags, so nothing else here
+# builds a branch.
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_API: "26"
+  GRADLE_ANDROID_NDK_VERSION: "26.3.11579264"
+  STORMDNS_ANDROID_NDK_VERSION: "29.0.14206865"
+
+jobs:
+  debug:
+    name: Build debug APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout WhiteDNS
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${GRADLE_ANDROID_NDK_VERSION}" \
+            "ndk;${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Build restart-safe Android VPN bridge
+        env:
+          NDK_HOST: linux-x86_64
+        run: |
+          set -euo pipefail
+          NDK_ROOT="${ANDROID_HOME}/ndk/${STORMDNS_ANDROID_NDK_VERSION}" bash scripts/build-tun2proxy-engine.sh
+
+      - name: Upload verified VPN native libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun2proxy-native-${{ github.sha }}
+          path: |
+            app/src/main/jniLibs/**/libtun2proxy.so
+            app/src/main/assets/tun2proxy-build.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: |
+            third_party/StormDNS/go.sum
+            third_party/CottenDns/go.sum
+            soar-engine/go.sum
+
+      - name: Report pinned engine commits
+        run: |
+          set -euo pipefail
+          echo "StormDNS  $(git -C third_party/StormDNS rev-parse HEAD)"
+          echo "CottenDns $(git -C third_party/CottenDns rev-parse HEAD)"
+
+      - name: Build DNS native clients
+        run: |
+          set -euo pipefail
+          make stormdns cottendns soar \
+            NDK_HOST=linux-x86_64 \
+            NDK_ROOT="${ANDROID_HOME}/ndk/${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Verify native core versions
+        run: python3 scripts/verify-cottendns-apks.py --native-only
+
+      - name: Test reviewed CottenDNS core
+        working-directory: third_party/CottenDns
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 180s
+          go vet ./...
+
+      - name: Test Soar engine
+        working-directory: soar-engine
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 90s
+          go vet ./...
+
+      - name: Test patched Soar transport and wire compatibility
+        working-directory: soar-engine/third_party/soar
+        run: |
+          go mod verify
+          go test ./... -count=1 -timeout 120s
+          go test -race ./... -count=1 -timeout 300s
+          go vet ./...
+
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest
+
+      - name: Build debug APKs
+        run: ./gradlew :app:assembleDebug
+
+      - name: Verify packaged Soar cores
+        run: python3 scripts/verify-soar-apks.py app/build/outputs/apk/debug
+
+      - name: Verify packaged CottenDNS cores
+        run: python3 scripts/verify-cottendns-apks.py app/build/outputs/apk/debug
+
+      - name: Verify packaged VPN native libraries
+        run: python3 scripts/verify-tun2proxy-native.py app/build/outputs/apk/debug
+
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: whitedns-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
