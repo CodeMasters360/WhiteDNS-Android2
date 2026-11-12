@@ -241,6 +241,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG_NAME="${RELEASE_TAG}"
@@ -253,21 +254,20 @@ jobs:
             printf 'Automated WhiteDNS release %s. Synced with upstream.\n' "$TAG_NAME" > "$NOTES_FILE"
           fi
 
-          # Always flag as latest release
-          release_flags=(--latest=true)
+          # Always flag as latest release targeting your personal repository
+          release_flags=(--latest=true --repo "${TARGET_REPO}")
 
-          # Ensure the tag is pushed to GitHub remote if not already present
-          if ! git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
-            git tag "${TAG_NAME}"
-            git push origin "${TAG_NAME}" || true
-          fi
+          # Ensure the tag is pushed to your personal repository remote
+          git tag "${TAG_NAME}" -f
+          git push origin "${TAG_NAME}" --force || true
 
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            echo ">>> Updating existing release..."
+          # Check and publish strictly to your own repository
+          if gh release view "${TAG_NAME}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
+            echo ">>> Updating existing release in ${TARGET_REPO}..."
             gh release edit "${TAG_NAME}" "${release_flags[@]}"
-            gh release upload "${TAG_NAME}" dist/* --clobber
+            gh release upload "${TAG_NAME}" dist/* --clobber --repo "${TARGET_REPO}"
           else
-            echo ">>> Creating new release..."
+            echo ">>> Creating new release in ${TARGET_REPO}..."
             gh release create "${TAG_NAME}" dist/* \
               --title "${RELEASE_TITLE}" \
               --notes-file "${NOTES_FILE}" \
