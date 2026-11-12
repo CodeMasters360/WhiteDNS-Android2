@@ -33,21 +33,13 @@ jobs:
           git remote add upstream "${UPSTREAM_REPO}" || git remote set-url upstream "${UPSTREAM_REPO}"
           git fetch upstream --tags --force
           
-          # Detect upstream default branch (usually main or master)
+          # Detect upstream default branch (e.g. main or master)
           UPSTREAM_BRANCH=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
           echo ">>> Upstream default branch: ${UPSTREAM_BRANCH}"
           
-          # Configure dummy identity to allow merge
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Merge latest upstream changes discarding local workflow overrides
-          git merge "upstream/${UPSTREAM_BRANCH}" -m "Auto-merge latest upstream changes" || {
-            echo ">>> Merge conflict encountered, falling back to upstream state..."
-            git checkout --theirs .
-            git add -A
-            git commit -m "Auto-resolved merge conflicts using upstream"
-          }
+          # Hard reset working directory to latest upstream commit
+          echo ">>> Syncing working tree to upstream/${UPSTREAM_BRANCH}..."
+          git reset --hard "upstream/${UPSTREAM_BRANCH}"
 
       - name: Fetch and set up native DNS dependencies
         run: |
@@ -261,10 +253,10 @@ jobs:
             printf 'Automated WhiteDNS release %s. Synced with upstream.\n' "$TAG_NAME" > "$NOTES_FILE"
           fi
 
-          # Always publish and flag as latest release
+          # Always flag as latest release
           release_flags=(--latest=true)
 
-          # Check if tag exists locally in git; if not, create it so gh release won't fail
+          # Ensure the tag is pushed to GitHub remote if not already present
           if ! git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
             git tag "${TAG_NAME}"
             git push origin "${TAG_NAME}" || true
