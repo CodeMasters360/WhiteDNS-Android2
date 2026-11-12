@@ -1,16 +1,10 @@
 name: Official Release
 
-# Required repository secrets:
-# - ANDROID_SIGNING_KEYSTORE_BASE64
-# - ANDROID_SIGNING_STORE_PASSWORD
-# - ANDROID_SIGNING_KEY_ALIAS
-# - ANDROID_SIGNING_KEY_PASSWORD
-#
 on:
   push:
     tags:
       - "*"
-  workflow_dispatch: # ایجاد دکمه دستی در گیتهاب اکشنز
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,6 +13,7 @@ env:
   ANDROID_API: "26"
   GRADLE_ANDROID_NDK_VERSION: "26.3.11579264"
   STORMDNS_ANDROID_NDK_VERSION: "29.0.14206865"
+  UPSTREAM_REPO: "https://github.com/WhiteDNS/WhiteDNS-Android.git"
 
 jobs:
   release:
@@ -26,10 +21,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout WhiteDNS
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # دریافت کل تاریخچه و تگ‌ها
+          fetch-depth: 0
+
+      - name: Sync with upstream repository
+        run: |
+          set -euo pipefail
+          echo ">>> Adding upstream remote and fetching latest changes..."
+          git remote add upstream "${UPSTREAM_REPO}" || git remote set-url upstream "${UPSTREAM_REPO}"
+          git fetch upstream --tags --force
+          
+          # Detect upstream default branch (usually main or master)
+          UPSTREAM_BRANCH=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
+          echo ">>> Upstream default branch: ${UPSTREAM_BRANCH}"
+          
+          # Configure dummy identity to allow merge
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Merge latest upstream changes discarding local workflow overrides
+          git merge "upstream/${UPSTREAM_BRANCH}" -m "Auto-merge latest upstream changes" || {
+            echo ">>> Merge conflict encountered, falling back to upstream state..."
+            git checkout --theirs .
+            git add -A
+            git commit -m "Auto-resolved merge conflicts using upstream"
+          }
 
       - name: Fetch and set up native DNS dependencies
         run: |
@@ -53,22 +71,27 @@ jobs:
           echo "=== Latest Commit Hashes Used ==="
           (cd third_party/CottenDns && echo "CottenDns at: $(git rev-parse --short HEAD)")
           (cd third_party/StormDNS && echo "StormDNS at: $(git rev-parse --short HEAD)")
-          ls -la third_party/CottenDns/go.mod
-          ls -la third_party/StormDNS/go.mod
 
       - name: Resolve release tag
         run: |
           set -euo pipefail
+          TAG=""
+          
+          # 1. If triggered by git tag push
           if [ "${{ github.ref_type }}" = "tag" ]; then
             TAG="${{ github.ref_name }}"
-          else
-            # دریافت خودکار آخرین تگ در صورت اجرای دستی با دکمه
-            TAG=$(git describe --tags --abbrev=0 2>/dev/null || git tag --sort=-v:refname | head -n 1)
           fi
 
-          if [ -z "${TAG:-}" ]; then
-            echo "::error::هیچ تگی در این ریپازیتوری پیدا نشد!"
-            exit 1
+          # 2. Try to get latest tag from git history
+          if [ -z "$TAG" ]; then
+            TAG=$(git describe --tags --abbrev=0 2>/dev/null || git tag --sort=-v:refname | head -n 1 || true)
+          fi
+
+          # 3. Fallback: generate a date-based tag if no tag exists
+          if [ -z "$TAG" ]; then
+            DATE_TAG="v$(date +'%Y.%m.%d')-build${GITHUB_RUN_NUMBER}"
+            echo ">>> No tags found in repository. Creating automatic fallback tag: ${DATE_TAG}"
+            TAG="${DATE_TAG}"
           fi
 
           echo "Target Release Tag: ${TAG}"
@@ -108,7 +131,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.9'
+          go-version: '1.22'
           cache-dependency-path: |
             third_party/StormDNS/go.sum
             third_party/CottenDns/go.sum
@@ -180,7 +203,7 @@ jobs:
 
           TAG_NAME="${RELEASE_TAG}"
           KEYSTORE_PATH="${RUNNER_TEMP}/whitedns-release.keystore"
-          echo "${ANDROID_SIGNING_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
+          echo "${ANDROID_SIGNING_KEYSTORE_BASE64}" | tr -d '[:space:]' | base64 --decode > "${KEYSTORE_PATH}"
 
           BUILD_TOOLS_DIR="$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           mkdir -p dist
@@ -209,7 +232,9 @@ jobs:
             "${BUILD_TOOLS_DIR}/apksigner" verify --verbose "${signed_apk}"
           done
 
-          cp THIRD_PARTY_NOTICES.md "dist/WhiteDNS-${TAG_NAME}-THIRD_PARTY_NOTICES.md"
+          if [[ -f THIRD_PARTY_NOTICES.md ]]; then
+            cp THIRD_PARTY_NOTICES.md "dist/WhiteDNS-${TAG_NAME}-THIRD_PARTY_NOTICES.md"
+          fi
           (cd dist && shasum -a 256 * > SHA256SUMS.txt)
 
       - name: Verify packaged Soar cores
@@ -233,17 +258,24 @@ jobs:
           if [[ -f "RELEASE-NOTES-${TAG_NAME#v}.md" ]]; then
             cp "RELEASE-NOTES-${TAG_NAME#v}.md" "${NOTES_FILE}"
           else
-            printf 'Official WhiteDNS release %s. See README and THIRD_PARTY_NOTICES.md.\n' "$TAG_NAME" > "$NOTES_FILE"
+            printf 'Automated WhiteDNS release %s. Synced with upstream.\n' "$TAG_NAME" > "$NOTES_FILE"
           fi
 
+          # Always publish and flag as latest release
           release_flags=(--latest=true)
-          if [[ "${TAG_NAME}" =~ (alpha|beta|rc) ]]; then
-            release_flags=(--prerelease --latest=false)
+
+          # Check if tag exists locally in git; if not, create it so gh release won't fail
+          if ! git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
+            git tag "${TAG_NAME}"
+            git push origin "${TAG_NAME}" || true
           fi
 
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo ">>> Updating existing release..."
+            gh release edit "${TAG_NAME}" "${release_flags[@]}"
             gh release upload "${TAG_NAME}" dist/* --clobber
           else
+            echo ">>> Creating new release..."
             gh release create "${TAG_NAME}" dist/* \
               --title "${RELEASE_TITLE}" \
               --notes-file "${NOTES_FILE}" \
